@@ -206,8 +206,40 @@
       color: #d6e4ff;
     }
   </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
+
+  <div class="shell" style="padding-bottom:0;">
+    <section class="card">
+      <div class="card-head">
+        <div class="title-wrap">
+          <h2>Cloud Login</h2>
+          <p>Use your Supabase account here. Signed-in mode saves months to cloud and keeps local browser backup too.</p>
+        </div>
+        <div class="section-toggle">
+          <span class="pill" id="authModePill">Cloud: Not signed in</span>
+        </div>
+      </div>
+      <div class="toolbar">
+        <label class="field">
+          Email
+          <input id="authEmail" type="email" placeholder="you@example.com" />
+        </label>
+        <label class="field">
+          Password
+          <input id="authPassword" type="password" placeholder="Password" />
+        </label>
+        <button class="primary" id="signUpBtn">Sign Up</button>
+        <button class="good" id="signInBtn">Sign In</button>
+        <button id="signOutBtn">Sign Out</button>
+        <button id="cloudRefreshBtn">Refresh Cloud Months</button>
+      </div>
+      <div class="status-bar" id="authStatus">Cloud is configured. Sign in to start using Supabase storage.</div>
+    </section>
+  </div>
+
   <div class="shell">
     <section class="card">
       <div class="card-head">
@@ -337,9 +369,16 @@
   const DB_KEY = "finance_hub_cloud_ready_v1_db";
   const SETTINGS_KEY = "finance_hub_cloud_ready_v1_settings";
 
+  const SUPABASE_URL = "https://narkeyggfnvnzwkknfxe.supabase.co";
+  const SUPABASE_KEY = "sb_publishable_xMKK7r4Ba9-iNO-2nbB0Bg_FzzuAB5P";
+  const supabaseClient = window.supabase?.createClient
+    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY)
+    : null;
+
   const $ = (id) => document.getElementById(id);
   const expenseFrame = $("expenseFrame");
   const payFrame = $("payFrame");
+  let cloudMonthsCache = {};
 
   function decodeB64Unicode(b64) {
     return decodeURIComponent(Array.prototype.map.call(atob(b64), c =>
@@ -396,7 +435,7 @@
   }
   function saveStorage(db) {
     localStorage.setItem(DB_KEY, JSON.stringify(db));
-    $("dbStatus").textContent = "Database: Local browser mode";
+    if (!currentUser()) $("dbStatus").textContent = "Database: Local browser mode";
   }
   function saveSettings(o) {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(o));
@@ -410,6 +449,147 @@
   }
   function activeMonthValue() {
     return $("activeMonth").value || new Date().toISOString().slice(0,7);
+  }
+
+  function currentUser() {
+    return supabaseClient?.auth?.getUser ? null : null;
+  }
+
+  let signedInUser = null;
+
+  function setAuthStatus(msg) {
+    $("authStatus").textContent = msg;
+  }
+
+  function updateAuthUi() {
+    const signedIn = !!signedInUser;
+    $("authModePill").textContent = signedIn ? `Cloud: Signed in as ${signedInUser.email}` : "Cloud: Not signed in";
+    $("dbStatus").textContent = signedIn ? "Database: Cloud + local backup mode" : "Database: Local browser mode";
+    $("signOutBtn").disabled = !signedIn;
+  }
+
+  async function refreshSession() {
+    if (!supabaseClient) {
+      setAuthStatus("Supabase library did not load.");
+      updateAuthUi();
+      return;
+    }
+    const { data, error } = await supabaseClient.auth.getUser();
+    signedInUser = error ? null : (data?.user || null);
+    updateAuthUi();
+  }
+
+  function mergedMonths() {
+    const localMonths = storage().months || {};
+    return signedInUser ? { ...localMonths, ...cloudMonthsCache } : localMonths;
+  }
+
+  async function fetchCloudMonths() {
+    if (!signedInUser || !supabaseClient) {
+      cloudMonthsCache = {};
+      return {};
+    }
+    const { data, error } = await supabaseClient
+      .from("months")
+      .select("month_key, processed, payload, created_at")
+      .eq("user_id", signedInUser.id)
+      .order("month_key", { ascending: false });
+
+    if (error) {
+      setAuthStatus(`Cloud load failed: ${error.message}`);
+      return cloudMonthsCache;
+    }
+
+    const obj = {};
+    (data || []).forEach(row => {
+      const payload = row.payload || {};
+      const monthKey = row.month_key || payload.monthKey;
+      if (!monthKey) return;
+      obj[monthKey] = {
+        ...payload,
+        monthKey,
+        processed: !!row.processed,
+        savedAt: payload.savedAt || row.created_at || new Date().toISOString()
+      };
+    });
+    cloudMonthsCache = obj;
+    return obj;
+  }
+
+  async function saveMonthToCloud(payload) {
+    if (!signedInUser || !supabaseClient) return { skipped: true };
+    const row = {
+      month_key: payload.monthKey,
+      processed: !!payload.processed,
+      payload,
+      user_id: signedInUser.id
+    };
+    const { error } = await supabaseClient
+      .from("months")
+      .upsert(row, { onConflict: "user_id,month_key" });
+    if (error) {
+      setAuthStatus(`Cloud save failed: ${error.message}`);
+      return { error };
+    }
+    cloudMonthsCache[payload.monthKey] = payload;
+    setAuthStatus(`Cloud save complete for ${payload.monthKey}.`);
+    return { ok: true };
+  }
+
+  async function deleteMonthFromCloud(monthKey) {
+    if (!signedInUser || !supabaseClient) return { skipped: true };
+    const { error } = await supabaseClient
+      .from("months")
+      .delete()
+      .eq("user_id", signedInUser.id)
+      .eq("month_key", monthKey);
+    if (error) {
+      setAuthStatus(`Cloud delete failed: ${error.message}`);
+      return { error };
+    }
+    delete cloudMonthsCache[monthKey];
+    setAuthStatus(`Cloud delete complete for ${monthKey}.`);
+    return { ok: true };
+  }
+
+  async function signUp() {
+    const email = $("authEmail").value.trim();
+    const password = $("authPassword").value.trim();
+    if (!email || !password) {
+      setAuthStatus("Enter both email and password first.");
+      return;
+    }
+    const { error } = await supabaseClient.auth.signUp({ email, password });
+    setAuthStatus(error ? `Sign up failed: ${error.message}` : "Sign up worked. Check your email if Supabase asks for confirmation.");
+    await refreshSession();
+    await refreshSavedMonths();
+    renderAverages();
+  }
+
+  async function signIn() {
+    const email = $("authEmail").value.trim();
+    const password = $("authPassword").value.trim();
+    if (!email || !password) {
+      setAuthStatus("Enter both email and password first.");
+      return;
+    }
+    const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+    setAuthStatus(error ? `Sign in failed: ${error.message}` : "Signed in successfully.");
+    await refreshSession();
+    await fetchCloudMonths();
+    await refreshSavedMonths();
+    renderAverages();
+  }
+
+  async function signOut() {
+    if (!supabaseClient) return;
+    await supabaseClient.auth.signOut();
+    signedInUser = null;
+    cloudMonthsCache = {};
+    updateAuthUi();
+    setAuthStatus("Signed out. Local browser data is still available on this device.");
+    await refreshSavedMonths();
+    renderAverages();
   }
 
   function expenseWindow() { return expenseFrame.contentWindow; }
@@ -558,7 +738,7 @@
     $("syncStatus").textContent = "Sync: Live two-way bridge active";
   }
 
-  function saveMonth(processed = false) {
+  async function saveMonth(processed = false) {
     const eDoc = getDoc(expenseFrame);
     const pDoc = getDoc(payFrame);
     if (!eDoc || !pDoc) return;
@@ -576,14 +756,14 @@
     };
     db.months[monthKey] = payload;
     saveStorage(db);
-    refreshSavedMonths(monthKey);
+    await saveMonthToCloud(payload);
+    await refreshSavedMonths(monthKey);
     renderAverages();
     setLog(`${processed ? "Processed" : "Draft"} month saved: ${monthKey}`);
   }
 
   function loadMonth(monthKey) {
-    const db = storage();
-    const rec = db.months[monthKey];
+    const rec = mergedMonths()[monthKey];
     if (!rec) return;
     restoreForm(getDoc(expenseFrame), rec.expenseForm);
     restoreForm(getDoc(payFrame), rec.payForm);
@@ -596,19 +776,23 @@
     }, 120);
   }
 
-  function deleteMonth(monthKey) {
+  async function deleteMonth(monthKey) {
     const db = storage();
     if (!db.months[monthKey]) return;
     delete db.months[monthKey];
     saveStorage(db);
-    refreshSavedMonths();
+    await deleteMonthFromCloud(monthKey);
+    await refreshSavedMonths();
     renderAverages();
     setLog(`Deleted month ${monthKey}.`);
   }
 
-  function refreshSavedMonths(selected) {
-    const db = storage();
-    const months = Object.keys(db.months).sort().reverse();
+  async function refreshSavedMonths(selected) {
+    if (signedInUser) {
+      await fetchCloudMonths();
+    }
+    const monthsObj = mergedMonths();
+    const months = Object.keys(monthsObj).sort().reverse();
     const sel = $("savedMonths");
     sel.innerHTML = "";
     const opt0 = document.createElement("option");
@@ -616,14 +800,14 @@
     opt0.textContent = months.length ? "Select a saved month" : "No saved months yet";
     sel.appendChild(opt0);
     months.forEach(key => {
-      const rec = db.months[key];
+      const rec = monthsObj[key];
       const opt = document.createElement("option");
       opt.value = key;
       opt.textContent = `${key}${rec.processed ? " • Processed" : " • Draft"}`;
       sel.appendChild(opt);
     });
     if (selected && months.includes(selected)) sel.value = selected;
-    const processedCount = months.filter(k => db.months[k]?.processed).length;
+    const processedCount = months.filter(k => monthsObj[k]?.processed).length;
     $("metricProcessed").textContent = String(processedCount);
   }
 
@@ -633,8 +817,7 @@
   }
 
   function computeAverages() {
-    const db = storage();
-    const rows = Object.values(db.months || {}).filter(x => x.processed);
+    const rows = Object.values(mergedMonths() || {}).filter(x => x.processed);
     const metrics = {
       processedMonths: rows.length,
       avgRent: 0,
@@ -725,7 +908,8 @@
         const parsed = JSON.parse(String(reader.result || ""));
         if (!parsed || typeof parsed !== "object" || !parsed.months) throw new Error("Invalid database");
         saveStorage(parsed);
-        refreshSavedMonths();
+        await refreshSession();
+    await refreshSavedMonths();
         renderAverages();
         setLog("Database imported successfully.");
       } catch (err) {
@@ -742,7 +926,7 @@
     btn.textContent = hidden ? labelB : labelA;
   }
 
-  function initializeIfReady() {
+  async function initializeIfReady() {
     if (!(expenseReady && payReady)) return;
     attachSyncListeners();
     const settings = loadSettings();
@@ -755,6 +939,8 @@
     setLog("Both apps loaded. Integration is live.");
   }
 
+  updateAuthUi();
+
   expenseFrame.addEventListener("load", () => {
     expenseReady = true;
     initializeIfReady();
@@ -764,15 +950,15 @@
     initializeIfReady();
   });
 
-  $("saveDraftBtn").addEventListener("click", () => saveMonth(false));
-  $("markProcessedBtn").addEventListener("click", () => saveMonth(true));
+  $("saveDraftBtn").addEventListener("click", async () => { await saveMonth(false); });
+  $("markProcessedBtn").addEventListener("click", async () => { await saveMonth(true); });
   $("loadMonthBtn").addEventListener("click", () => {
     const key = $("savedMonths").value;
     if (key) loadMonth(key);
   });
-  $("deleteMonthBtn").addEventListener("click", () => {
+  $("deleteMonthBtn").addEventListener("click", async () => {
     const key = $("savedMonths").value;
-    if (key) deleteMonth(key);
+    if (key) await deleteMonth(key);
   });
   $("syncNowBtn").addEventListener("click", () => {
     syncExpenseToPay();
@@ -780,7 +966,7 @@
   });
   $("pullFromExpenseBtn").addEventListener("click", syncExpenseToPay);
   $("pullFromPayBtn").addEventListener("click", syncPayToExpense);
-  $("refreshAveragesBtn").addEventListener("click", renderAverages);
+  $("refreshAveragesBtn").addEventListener("click", async () => { await refreshSavedMonths($("savedMonths").value); renderAverages(); });
   $("exportDbBtn").addEventListener("click", exportDatabase);
   $("importDbBtn").addEventListener("click", () => $("importDbInput").click());
   $("importDbInput").addEventListener("change", (e) => {
@@ -790,6 +976,23 @@
   });
   $("toggleExpenseBtn").addEventListener("click", () => toggleSection("expenseFrame", "toggleExpenseBtn", "Hide Expense Section", "Unhide Expense Section"));
   $("togglePayBtn").addEventListener("click", () => toggleSection("payFrame", "togglePayBtn", "Hide Weekly Pay Section", "Unhide Weekly Pay Section"));
+  $("signUpBtn").addEventListener("click", signUp);
+  $("signInBtn").addEventListener("click", signIn);
+  $("signOutBtn").addEventListener("click", signOut);
+  $("cloudRefreshBtn").addEventListener("click", async () => {
+    await refreshSession();
+    await refreshSavedMonths($("savedMonths").value);
+    renderAverages();
+    setAuthStatus(signedInUser ? "Cloud months refreshed." : "Not signed in, so only local browser months are available.");
+  });
+  if (supabaseClient?.auth?.onAuthStateChange) {
+    supabaseClient.auth.onAuthStateChange(async (_event, session) => {
+      signedInUser = session?.user || null;
+      updateAuthUi();
+      await refreshSavedMonths($("savedMonths").value);
+      renderAverages();
+    });
+  }
   $("activeMonth").addEventListener("change", () => {
     saveSettings({ activeMonth: $("activeMonth").value });
   });
