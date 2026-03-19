@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Finance Hub Cloud Ready V1</title>
+  <title>Finance Hub Cloud Ready V7 Exact Averages + Excel Import</title>
   <style>
     :root {
       --bg: #0b1220;
@@ -207,6 +207,7 @@
     }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 </head>
 <body>
   <div class="shell">
@@ -443,11 +444,17 @@
     });
   }
 
+
   function getExpenseState() {
     try {
       const win = expenseWindow();
-      if (win && win.state) {
+      if (!win) return null;
+      if (win.state) {
         return JSON.parse(JSON.stringify(win.state));
+      }
+      if (typeof win.eval === "function") {
+        const raw = win.eval(`(function(){ try { return JSON.stringify(typeof state !== "undefined" ? state : null); } catch (e) { return "null"; } })()`);
+        return JSON.parse(raw || "null");
       }
     } catch {}
     return null;
@@ -633,14 +640,68 @@
     return values.reduce((a,b) => a + b, 0) / values.length;
   }
 
+
+  function extractDollarAmountsLite(text) {
+    if (!text) return 0;
+    const matches = String(text).match(/\$\s*\d+(?:,\d{3})*(?:\.\d+)?/g) || [];
+    return matches.reduce((sum, item) => sum + num(item.replace(/[$,\s]/g, "")), 0);
+  }
+
+  function groceryAdjustedTotalFromState(state) {
+    const grocery = Array.isArray(state?.grocery) ? state.grocery : [];
+    return grocery.reduce((acc, row) => {
+      const discounted = num(row?.realBill) * num(row?.factor || 1);
+      const excluded = extractDollarAmountsLite(row?.notUsedText || "");
+      const fullPay = extractDollarAmountsLite(row?.fullPayText || "");
+      return acc + Math.max(0, discounted - excluded - fullPay);
+    }, 0);
+  }
+
+  function labeledAmountFromRows(rows, exactLabel) {
+    const row = (rows || []).find(item => String(item?.label || "").trim() === exactLabel);
+    return row ? num(row.amount) : 0;
+  }
+
+  function expenseBreakdownFromState(state) {
+    const shared = Array.isArray(state?.shared) ? state.shared : [];
+    const extra = Array.isArray(state?.extra) ? state.extra : [];
+
+    const rent = labeledAmountFromRows(shared, "Apartment_250_Boyd_Ave");
+    const electricity = labeledAmountFromRows(shared, "Electricity_250_Boyd_Ave");
+    const internet = labeledAmountFromRows(shared, "Internet_Verizon_FIOS");
+    const tuition = labeledAmountFromRows(shared, "Viaan@PCD_Tuition");
+
+    const foodRow = shared.find(item => String(item?.label || "").trim() === "Food_Calculated_Separately");
+    let food = foodRow ? num(foodRow.amount) : 0;
+    if (foodRow?.autoFromGrocery || (!food && Array.isArray(state?.grocery) && state.grocery.length)) {
+      food = groceryAdjustedTotalFromState(state);
+    }
+
+    const healthRow = shared.find(item => String(item?.label || "").trim() === "Insurance_Health_Vishu_Viaan");
+    let health = healthRow ? num(healthRow.amount) : 0;
+    if (!health && healthRow?.specialCalc) {
+      health = num(healthRow.specialCalc.regularFamily) + num(healthRow.specialCalc.viaanDental) + num(healthRow.specialCalc.visionFamily);
+    }
+
+    const fuelExtra = labeledAmountFromRows(extra, "Fuel_50_50");
+    const fuelShared = labeledAmountFromRows(shared, "Fuel_50_50");
+    const car = fuelExtra || fuelShared;
+
+    return { rent, food, car, electricity, internet, tuition, health };
+  }
+
   function computeAverages() {
     const db = storage();
-    const rows = Object.values(db.months || {}).filter(x => x.processed);
+    const rows = Object.values(db.months || {}).filter(x => x && x.processed);
     const metrics = {
       processedMonths: rows.length,
       avgRent: 0,
       avgFood: 0,
       avgCar: 0,
+      avgElectricity: 0,
+      avgInternet: 0,
+      avgTuition: 0,
+      avgHealthInsurance: 0,
       avgAnuYearlyGross: 0,
       avgVishuHourlyRate: 0,
       avgVishuHoursPerWeek: 0,
@@ -651,6 +712,10 @@
     const rentVals = [];
     const foodVals = [];
     const carVals = [];
+    const electricityVals = [];
+    const internetVals = [];
+    const tuitionVals = [];
+    const healthVals = [];
     const anuVals = [];
     const hourlyVals = [];
     const hoursVals = [];
@@ -663,23 +728,24 @@
       hoursVals.push(num(m.expense?.vishuHoursPerWeek));
       vishuMonthVals.push(num(m.expense?.vishuMonthlyGross));
 
-      const shared = m.expenseState?.shared || [];
-      let rent = 0, food = 0, car = 0;
-      shared.forEach(item => {
-        const label = String(item?.label || "").toLowerCase();
-        const amount = num(item?.amount);
-        if (/rent|apartment|boyd/.test(label)) rent += amount;
-        if (/food|grocery|walmart|shaw|stop.?shop/.test(label)) food += amount;
-        if (/car|insurance|gas|repair|registration|transport/.test(label)) car += amount;
-      });
-      rentVals.push(rent);
-      foodVals.push(food);
-      carVals.push(car);
+      const state = m.expenseState || row.expenseState || null;
+      const exact = expenseBreakdownFromState(state);
+      rentVals.push(exact.rent);
+      foodVals.push(exact.food);
+      carVals.push(exact.car);
+      electricityVals.push(exact.electricity);
+      internetVals.push(exact.internet);
+      tuitionVals.push(exact.tuition);
+      healthVals.push(exact.health);
     });
 
     metrics.avgRent = avg(rentVals);
     metrics.avgFood = avg(foodVals);
     metrics.avgCar = avg(carVals);
+    metrics.avgElectricity = avg(electricityVals);
+    metrics.avgInternet = avg(internetVals);
+    metrics.avgTuition = avg(tuitionVals);
+    metrics.avgHealthInsurance = avg(healthVals);
     metrics.avgAnuYearlyGross = avg(anuVals);
     metrics.avgVishuHourlyRate = avg(hourlyVals);
     metrics.avgVishuHoursPerWeek = avg(hoursVals);
@@ -692,9 +758,13 @@
     const body = $("avgTableBody");
     const rows = [
       ["Processed Months", a.processedMonths, "Count of locked months only"],
-      ["Average Rent / Housing", money(a.avgRent), "Pulled from saved expense rows whose labels look like rent, apartment, or housing"],
-      ["Average Food / Grocery", money(a.avgFood), "Pulled from saved expense rows tagged by food/grocery-style labels"],
-      ["Average Car / Transportation", money(a.avgCar), "Pulled from saved expense rows tagged by car, insurance, gas, repair, or transport-style labels"],
+      ["Average Rent / Housing", money(a.avgRent), "Exact match on Apartment_250_Boyd_Ave"],
+      ["Average Food / Grocery", money(a.avgFood), "Exact match on Food_Calculated_Separately (fed from grocery ledger when that row is auto-calculated)"],
+      ["Average Car / Transportation", money(a.avgCar), "Exact match on Fuel_50_50"],
+      ["Average Electricity", money(a.avgElectricity), "Exact match on Electricity_250_Boyd_Ave"],
+      ["Average Internet", money(a.avgInternet), "Exact match on Internet_Verizon_FIOS"],
+      ["Average Viaan Tuition", money(a.avgTuition), "Exact match on Viaan@PCD_Tuition"],
+      ["Average Health Insurance", money(a.avgHealthInsurance), "Exact match on Insurance_Health_Vishu_Viaan"],
       ["Average Anupam Yearly Gross", money(a.avgAnuYearlyGross), "Historical average of the core yearly income input"],
       ["Average Vishu Hourly Rate", money(a.avgVishuHourlyRate), "Historical average of Vishu's hourly rate"],
       ["Average Vishu Hours / Week", a.avgVishuHoursPerWeek.toFixed(2), "Historical average of weekly hours"],
@@ -710,6 +780,7 @@
   }
 
   function exportDatabase() {
+
     const blob = new Blob([JSON.stringify(storage(), null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
@@ -851,6 +922,56 @@
     if (m) return Number(m[1])*100 + Number(m[2]);
     return -1;
   }
+
+  function extractDollarAmountsLite(text) {
+    if (!text) return 0;
+    const matches = String(text).match(/\$\s*\d+(?:,\d{3})*(?:\.\d+)?/g) || [];
+    return matches.reduce((sum, item) => sum + num(item.replace(/[$,\s]/g, "")), 0);
+  }
+
+  function groceryAdjustedTotalFromState(state) {
+    const grocery = Array.isArray(state?.grocery) ? state.grocery : [];
+    return grocery.reduce((acc, row) => {
+      const discounted = num(row?.realBill) * num(row?.factor || 1);
+      const excluded = extractDollarAmountsLite(row?.notUsedText || "");
+      const fullPay = extractDollarAmountsLite(row?.fullPayText || "");
+      return acc + Math.max(0, discounted - excluded - fullPay);
+    }, 0);
+  }
+
+  function labeledAmountFromRows(rows, exactLabel) {
+    const row = (rows || []).find(item => String(item?.label || "").trim() === exactLabel);
+    return row ? num(row.amount) : 0;
+  }
+
+  function expenseBreakdownFromState(state) {
+    const shared = Array.isArray(state?.shared) ? state.shared : [];
+    const extra = Array.isArray(state?.extra) ? state.extra : [];
+
+    const rent = labeledAmountFromRows(shared, "Apartment_250_Boyd_Ave");
+    const electricity = labeledAmountFromRows(shared, "Electricity_250_Boyd_Ave");
+    const internet = labeledAmountFromRows(shared, "Internet_Verizon_FIOS");
+    const tuition = labeledAmountFromRows(shared, "Viaan@PCD_Tuition");
+
+    const foodRow = shared.find(item => String(item?.label || "").trim() === "Food_Calculated_Separately");
+    let food = foodRow ? num(foodRow.amount) : 0;
+    if (foodRow?.autoFromGrocery || (!food && Array.isArray(state?.grocery) && state.grocery.length)) {
+      food = groceryAdjustedTotalFromState(state);
+    }
+
+    const healthRow = shared.find(item => String(item?.label || "").trim() === "Insurance_Health_Vishu_Viaan");
+    let health = healthRow ? num(healthRow.amount) : 0;
+    if (!health && healthRow?.specialCalc) {
+      health = num(healthRow.specialCalc.regularFamily) + num(healthRow.specialCalc.viaanDental) + num(healthRow.specialCalc.visionFamily);
+    }
+
+    const fuelExtra = labeledAmountFromRows(extra, "Fuel_50_50");
+    const fuelShared = labeledAmountFromRows(shared, "Fuel_50_50");
+    const car = fuelExtra || fuelShared;
+
+    return { rent, food, car, electricity, internet, tuition, health };
+  }
+
   function refreshUiFromStorage() {
     const db = readHubDb();
     const months = Object.keys(db.months || {}).sort((a,b) => {
@@ -880,30 +1001,33 @@
 
     const num = (v) => Number(String(v ?? "").replace(/[^0-9.\-]/g, "")) || 0;
     const avg = (arr) => arr.length ? (arr.reduce((a,b)=>a+b,0) / arr.length) : 0;
-    const rentVals=[], foodVals=[], carVals=[], anuVals=[], hourlyVals=[], hoursVals=[], vishuVals=[];
+    const rentVals=[], foodVals=[], carVals=[], electricityVals=[], internetVals=[], tuitionVals=[], healthVals=[], anuVals=[], hourlyVals=[], hoursVals=[], vishuVals=[];
     for (const row of processedRows) {
       const m = row.metrics || {};
       anuVals.push(num(m.expense?.anuAnnualGross));
       hourlyVals.push(num(m.expense?.vishuHourlyRate));
       hoursVals.push(num(m.expense?.vishuHoursPerWeek));
       vishuVals.push(num(m.expense?.vishuMonthlyGross));
-      const shared = m.expenseState?.shared || row.expenseState?.shared || [];
-      let rent = 0, food = 0, car = 0;
-      for (const item of shared) {
-        const label = String(item?.label || "").toLowerCase();
-        const amount = num(item?.amount);
-        if (/rent|apartment|boyd|housing/.test(label)) rent += amount;
-        if (/food|grocery|walmart|shaw|stop.?shop/.test(label)) food += amount;
-        if (/car|insurance|gas|repair|registration|transport/.test(label)) car += amount;
-      }
-      rentVals.push(rent); foodVals.push(food); carVals.push(car);
+      const state = m.expenseState || row.expenseState || null;
+      const exact = expenseBreakdownFromState(state);
+      rentVals.push(exact.rent);
+      foodVals.push(exact.food);
+      carVals.push(exact.car);
+      electricityVals.push(exact.electricity);
+      internetVals.push(exact.internet);
+      tuitionVals.push(exact.tuition);
+      healthVals.push(exact.health);
     }
     const money = (n) => Number(n || 0).toLocaleString("en-US", { style: "currency", currency: "USD" });
     const rows = [
       ["Processed Months", processedRows.length, "Count of locked months only"],
-      ["Average Rent / Housing", money(avg(rentVals)), "Pulled from saved expense rows whose labels look like rent, apartment, or housing"],
-      ["Average Food / Grocery", money(avg(foodVals)), "Pulled from saved expense rows tagged by food/grocery-style labels"],
-      ["Average Car / Transportation", money(avg(carVals)), "Pulled from saved expense rows tagged by car, insurance, gas, repair, or transport-style labels"],
+      ["Average Rent / Housing", money(avg(rentVals)), "Exact match on Apartment_250_Boyd_Ave"],
+      ["Average Food / Grocery", money(avg(foodVals)), "Exact match on Food_Calculated_Separately (fed from grocery ledger when that row is auto-calculated)"],
+      ["Average Car / Transportation", money(avg(carVals)), "Exact match on Fuel_50_50"],
+      ["Average Electricity", money(avg(electricityVals)), "Exact match on Electricity_250_Boyd_Ave"],
+      ["Average Internet", money(avg(internetVals)), "Exact match on Internet_Verizon_FIOS"],
+      ["Average Viaan Tuition", money(avg(tuitionVals)), "Exact match on Viaan@PCD_Tuition"],
+      ["Average Health Insurance", money(avg(healthVals)), "Exact match on Insurance_Health_Vishu_Viaan"],
       ["Average Anupam Yearly Gross", money(avg(anuVals)), "Historical average of the core yearly income input"],
       ["Average Vishu Hourly Rate", money(avg(hourlyVals)), "Historical average of Vishu's hourly rate"],
       ["Average Vishu Hours / Week", avg(hoursVals).toFixed(2), "Historical average of weekly hours"],
@@ -1117,6 +1241,268 @@
     }
   }
 
+
+  function normalizeImportKey(raw) {
+    return String(raw || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  }
+
+  const IMPORT_KEY_ALIASES = {
+    month: "monthName",
+    monthname: "monthName",
+    monthkey: "monthName",
+    anuannualgross: "anuAnnualGross",
+    anupamyearlygross: "anuAnnualGross",
+    anuyearlygross: "anuAnnualGross",
+    anuincomeyearly: "anuAnnualGross",
+    vishuhourlyrate: "vishuHourlyRate",
+    baserate: "vishuHourlyRate",
+    hourlyrate: "vishuHourlyRate",
+    vishuhoursperweek: "vishuHoursPerWeek",
+    totalhours: "vishuHoursPerWeek",
+    hoursperweek: "vishuHoursPerWeek",
+    vishuweeksperyear: "vishuWeeksPerYear",
+    weeksperyear: "vishuWeeksPerYear",
+    apartment250boydave: "Apartment_250_Boyd_Ave",
+    apartment250boydaveroomrentmonth: "Apartment_250_Boyd_Ave",
+    electricity250boydave: "Electricity_250_Boyd_Ave",
+    internetverizonfios: "Internet_Verizon_FIOS",
+    foodcalculatedseparately: "Food_Calculated_Separately",
+    foodcalculatedseperately: "Food_Calculated_Separately",
+    viaanpcdtuition: "Viaan@PCD_Tuition",
+    insurancehealthvishuviaan: "Insurance_Health_Vishu_Viaan",
+    fuel5050: "Fuel_50_50",
+    carinsurancepaidfor6months: "Car_Insurance_Paid_For_6_Months"
+  };
+
+  function canonicalImportKey(raw) {
+    return IMPORT_KEY_ALIASES[normalizeImportKey(raw)] || null;
+  }
+
+  function monthKeyToPretty(monthKey) {
+    const m = String(monthKey || "").match(/^(\d{4})-(\d{2})$/);
+    if (!m) return String(monthKey || "");
+    const months = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+    return `${months[Math.max(0, Number(m[2]) - 1)]} ${m[1]}`;
+  }
+
+  function getLiveExpenseStateFromWindow() {
+    const win = expenseWindow();
+    if (!win) return null;
+    try {
+      if (win.state) return JSON.parse(JSON.stringify(win.state));
+      if (typeof win.eval === "function") {
+        const raw = win.eval(`(function(){ try { return JSON.stringify(typeof state !== "undefined" ? state : null); } catch (e) { return "null"; } })()`);
+        return JSON.parse(raw || "null");
+      }
+    } catch (err) {
+      console.error("Live expense state read failed:", err);
+    }
+    return null;
+  }
+
+  function setLiveExpenseStateOnWindow(nextState) {
+    const win = expenseWindow();
+    if (!win) return false;
+    try {
+      win.__financeHubImportedState = JSON.parse(JSON.stringify(nextState));
+      win.eval(`(function(){
+        try {
+          state = JSON.parse(JSON.stringify(window.__financeHubImportedState));
+          if (typeof ensureDefaultRowsPresent === "function") ensureDefaultRowsPresent();
+          if (typeof recalcIncomeFields === "function") recalcIncomeFields();
+          if (typeof renderAll === "function") renderAll();
+          if (typeof saveState === "function") saveState();
+        } catch (e) {
+          console.error("Imported expense state apply failed:", e);
+        } finally {
+          delete window.__financeHubImportedState;
+        }
+      })()`);
+      return true;
+    } catch (err) {
+      console.error("Expense state apply bridge failed:", err);
+      try { delete win.__financeHubImportedState; } catch {}
+      return false;
+    }
+  }
+
+  function ensureLabeledRow(rows, label, defaults) {
+    let row = (rows || []).find(item => String(item?.label || "").trim() === label);
+    if (!row) {
+      row = Object.assign({ label, amount: 0, split: "ratio", payer: "unassigned", anuExtra: 0, vishuExtra: 0 }, defaults || {});
+      rows.push(row);
+    }
+    return row;
+  }
+
+  function parseWorkbookToImportMap(fileBuffer) {
+    if (!window.XLSX) throw new Error("XLSX library did not load.");
+    const workbook = XLSX.read(fileBuffer, { type: "array" });
+    const firstSheetName = workbook.SheetNames?.[0];
+    if (!firstSheetName) throw new Error("The Excel file had no sheets.");
+    const sheet = workbook.Sheets[firstSheetName];
+    const out = {};
+
+    const objRows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+    objRows.forEach(row => {
+      const key = row.key ?? row.Key ?? row.field ?? row.Field ?? row.label ?? row.Label ?? row.name ?? row.Name ?? row.id ?? row.ID ?? row.input ?? row.Input;
+      const value = row.value ?? row.Value ?? row.amount ?? row.Amount ?? row.data ?? row.Data ?? row.entry ?? row.Entry;
+      const canonical = canonicalImportKey(key);
+      if (canonical && value !== "") out[canonical] = value;
+    });
+
+    if (!Object.keys(out).length) {
+      const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+      matrix.forEach(row => {
+        if (!Array.isArray(row) || row.length < 2) return;
+        const canonical = canonicalImportKey(row[0]);
+        if (canonical && row[1] !== "") out[canonical] = row[1];
+      });
+    }
+
+    return out;
+  }
+
+  function mirrorCoreExpenseInputsToPayFromState(state) {
+    const pDoc = document.getElementById("payFrame")?.contentDocument;
+    if (!pDoc) return;
+    const setVal = (id, value) => {
+      const el = pDoc.getElementById(id);
+      if (!el) return;
+      el.value = value == null ? "" : value;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    setVal("anupamYearlyGross", state?.anuAnnualGross ?? "");
+    setVal("baseRate", state?.vishuHourlyRate ?? "");
+    setVal("totalHours", state?.vishuHoursPerWeek ?? "");
+  }
+
+  function applyExpenseImportMap(importMap) {
+    const win = expenseWindow();
+    const eDoc = document.getElementById("expenseFrame")?.contentDocument;
+    if (!win || !eDoc) {
+      note("Monthly Expense app is not ready yet. Wait a second and try the Excel import again.", true);
+      return;
+    }
+
+    const state = getLiveExpenseStateFromWindow() || {};
+    state.shared = Array.isArray(state.shared) ? state.shared : [];
+    state.extra = Array.isArray(state.extra) ? state.extra : [];
+    state.grocery = Array.isArray(state.grocery) ? state.grocery : [];
+    state.adjustments = Array.isArray(state.adjustments) ? state.adjustments : [];
+
+    const parsedMonthKey = parseMonthNameToKey(importMap.monthName || $("activeMonth")?.value || "", $("activeMonth")?.value || "");
+    if (parsedMonthKey) {
+      const activeMonthEl = $("activeMonth");
+      if (activeMonthEl) activeMonthEl.value = parsedMonthKey;
+      state.monthName = monthKeyToPretty(parsedMonthKey);
+    } else if (importMap.monthName) {
+      state.monthName = String(importMap.monthName).trim();
+    }
+
+    if (importMap.anuAnnualGross !== undefined) state.anuAnnualGross = num(importMap.anuAnnualGross);
+    if (importMap.vishuHourlyRate !== undefined) state.vishuHourlyRate = num(importMap.vishuHourlyRate);
+    if (importMap.vishuHoursPerWeek !== undefined) state.vishuHoursPerWeek = num(importMap.vishuHoursPerWeek);
+    if (importMap.vishuWeeksPerYear !== undefined) state.vishuWeeksPerYear = num(importMap.vishuWeeksPerYear) || 52;
+
+    const rentRow = ensureLabeledRow(state.shared, "Apartment_250_Boyd_Ave");
+    const electricityRow = ensureLabeledRow(state.shared, "Electricity_250_Boyd_Ave");
+    const internetRow = ensureLabeledRow(state.shared, "Internet_Verizon_FIOS");
+    const tuitionRow = ensureLabeledRow(state.shared, "Viaan@PCD_Tuition", { split: "half" });
+    const healthRow = ensureLabeledRow(state.shared, "Insurance_Health_Vishu_Viaan");
+    const foodRow = ensureLabeledRow(state.shared, "Food_Calculated_Separately", { payer: "vishu", autoFromGrocery: true });
+    const fuelRow = ensureLabeledRow(state.extra, "Fuel_50_50", { split: "half", payer: "vishu" });
+    const carInsRow = ensureLabeledRow(state.shared, "Car_Insurance_Paid_For_6_Months");
+
+    if (importMap["Apartment_250_Boyd_Ave"] !== undefined) rentRow.amount = num(importMap["Apartment_250_Boyd_Ave"]);
+    if (importMap["Electricity_250_Boyd_Ave"] !== undefined) electricityRow.amount = num(importMap["Electricity_250_Boyd_Ave"]);
+    if (importMap["Internet_Verizon_FIOS"] !== undefined) internetRow.amount = num(importMap["Internet_Verizon_FIOS"]);
+    if (importMap["Viaan@PCD_Tuition"] !== undefined) tuitionRow.amount = num(importMap["Viaan@PCD_Tuition"]);
+    if (importMap["Insurance_Health_Vishu_Viaan"] !== undefined) healthRow.amount = num(importMap["Insurance_Health_Vishu_Viaan"]);
+    if (importMap["Fuel_50_50"] !== undefined) fuelRow.amount = num(importMap["Fuel_50_50"]);
+    if (importMap["Car_Insurance_Paid_For_6_Months"] !== undefined) carInsRow.amount = num(importMap["Car_Insurance_Paid_For_6_Months"]);
+
+    if (importMap["Food_Calculated_Separately"] !== undefined) {
+      const foodTotal = num(importMap["Food_Calculated_Separately"]);
+      foodRow.amount = foodTotal;
+      foodRow.autoFromGrocery = true;
+      foodRow.payer = foodRow.payer || "vishu";
+      const monthLabel = String(state.monthName || monthKeyToPretty(parsedMonthKey) || "").split(" ")[0] || "";
+      state.grocery = [{
+        store: "Imported From Excel",
+        date: "",
+        month: monthLabel,
+        realBill: foodTotal,
+        factor: 1,
+        notUsedText: "",
+        fullPayText: "",
+        payer: "vishu"
+      }];
+    }
+
+    const applied = setLiveExpenseStateOnWindow(state);
+    if (!applied) {
+      note("Excel import could not push the values into the Monthly Expense app.", true);
+      return;
+    }
+
+    mirrorCoreExpenseInputsToPayFromState(state);
+    refreshUiFromStorage();
+    note("Expense Excel imported. The Monthly Expense fields were prefilled. Review the values, then click Save Draft Month or Mark Month as Processed.");
+  }
+
+  function importExpenseExcelFile(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const importMap = parseWorkbookToImportMap(reader.result);
+        if (!Object.keys(importMap).length) {
+          note("Excel import failed because the first sheet did not have readable key/value pairs. Use either [Key, Value] rows or headers like Key/Value or Label/Amount.", true);
+          return;
+        }
+        applyExpenseImportMap(importMap);
+      } catch (err) {
+        note(`Excel import failed: ${err.message || err}`, true);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function injectExcelImportControls() {
+    if ($("importExpenseExcelBtn")) return;
+    const topToolbar = document.querySelector(".shell > section.card > .toolbar");
+    if (!topToolbar) return;
+
+    const btn = document.createElement("button");
+    btn.id = "importExpenseExcelBtn";
+    btn.textContent = "Import Expense Excel";
+    btn.type = "button";
+
+    const input = document.createElement("input");
+    input.id = "importExpenseExcelInput";
+    input.type = "file";
+    input.accept = ".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv";
+    input.hidden = true;
+
+    btn.addEventListener("click", () => input.click());
+    input.addEventListener("change", (e) => {
+      const file = e.target.files?.[0];
+      if (file) importExpenseExcelFile(file);
+      e.target.value = "";
+    });
+
+    topToolbar.appendChild(btn);
+    topToolbar.appendChild(input);
+
+    const help = document.createElement("div");
+    help.id = "excelImportHelp";
+    help.className = "status-bar";
+    help.textContent = "Expense Excel import accepts the first sheet as either [Key, Value] rows or headers like Key/Value or Label/Amount. Supported keys include monthName, anuAnnualGross, vishuHourlyRate, vishuHoursPerWeek, Apartment_250_Boyd_Ave, Electricity_250_Boyd_Ave, Internet_Verizon_FIOS, Food_Calculated_Separately, Viaan@PCD_Tuition, Insurance_Health_Vishu_Viaan, Fuel_50_50, and Car_Insurance_Paid_For_6_Months.";
+    topToolbar.insertAdjacentElement("afterend", help);
+  }
+
+
   function injectCloudPanel() {
     const shell = document.querySelector(".shell");
     if (!shell || $("cloudPanel")) return;
@@ -1208,6 +1594,7 @@
 
   function initCloudPatch() {
     injectCloudPanel();
+    injectExcelImportControls();
     loadNote();
     refreshUiFromStorage();
     refreshAuthStatus();
