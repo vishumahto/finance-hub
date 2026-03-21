@@ -657,7 +657,7 @@
     db.months[monthKey] = payload;
     saveStorage(db);
     refreshSavedMonths(monthKey);
-    renderAverages();
+    safeRenderAverages();
     setLog(`${processed ? "Processed" : "Draft"} month saved: ${monthKey}`);
   }
 
@@ -674,7 +674,7 @@
     setTimeout(() => {
       syncExpenseToPay();
       updateMetricCards();
-      renderAverages();
+      safeRenderAverages();
       setLog(`Loaded month ${monthKey}.`);
     }, imported ? 900 : 180);
   }
@@ -685,7 +685,7 @@
     delete db.months[monthKey];
     saveStorage(db);
     refreshSavedMonths();
-    renderAverages();
+    safeRenderAverages();
     setLog(`Deleted month ${monthKey}.`);
   }
 
@@ -702,7 +702,7 @@
       const rec = db.months[key];
       const opt = document.createElement("option");
       opt.value = key;
-      opt.textContent = `${key}${rec.processed ? " • Processed" : " • Draft"}`;
+      opt.textContent = `${formatMonthKeyForLabel(key)}${rec.processed ? " • Processed" : " • Draft"}`;
       sel.appendChild(opt);
     });
     if (selected && months.includes(selected)) sel.value = selected;
@@ -804,6 +804,15 @@ function computeAverages() {
     return metrics;
   }
 
+  function safeRenderAverages() {
+    try {
+      if (typeof window.renderAverages === "function") return window.renderAverages();
+      if (typeof renderAverages === "function") return renderAverages();
+    } catch (err) {
+      console.warn("safeRenderAverages warning:", err);
+    }
+  }
+
   function renderAverages() {
     const a = computeAverages();
     const body = $("avgTableBody");
@@ -853,7 +862,7 @@ function computeAverages() {
         if (!parsed || typeof parsed !== "object" || !parsed.months) throw new Error("Invalid database");
         saveStorage(parsed);
         refreshSavedMonths();
-        renderAverages();
+        safeRenderAverages();
         setLog("Database imported successfully.");
       } catch (err) {
         setLog("Import failed. JSON format was not valid for this hub.");
@@ -878,7 +887,7 @@ function computeAverages() {
     refreshSavedMonths();
     syncExpenseToPay();
     updateMetricCards();
-    renderAverages();
+    safeRenderAverages();
     setLog("Both apps loaded. Integration is live.");
   }
 
@@ -921,7 +930,7 @@ function computeAverages() {
   });
   $("pullFromExpenseBtn").addEventListener("click", syncExpenseToPay);
   $("pullFromPayBtn").addEventListener("click", syncPayToExpense);
-  $("refreshAveragesBtn").addEventListener("click", renderAverages);
+  $("refreshAveragesBtn").addEventListener("click", safeRenderAverages);
   $("exportDbBtn").addEventListener("click", exportDatabase);
   $("importDbBtn").addEventListener("click", () => $("importDbInput").click());
   $("importDbInput").addEventListener("change", (e) => {
@@ -1021,8 +1030,11 @@ function refreshUiFromStorage() {
         opt.textContent = formatMonthKeyForLabel(key) + (rec.processed ? " • Processed" : " • Draft");
         sel.appendChild(opt);
       }
+      const processedCount = months.filter(k => db.months[k]?.processed).length;
+      const metricEl = $("metricProcessed");
+      if (metricEl) metricEl.textContent = String(processedCount);
     }
-    if (typeof window.renderAverages === "function") window.renderAverages();
+    safeRenderAverages();
   }
 
   function parseMonthNameToKey(monthName, fallbackKey) {
@@ -1222,7 +1234,7 @@ function refreshUiFromStorage() {
       writeHubDb(db);
       refreshUiFromStorage();
       note(`Cloud months refreshed: ${(data || []).length} row${(data || []).length === 1 ? "" : "s"} merged into this browser.`);
-      if (typeof window.renderAverages === "function") window.renderAverages();
+      safeRenderAverages();
     } catch (err) {
       note(`Cloud load failed: ${err.message || err}`, true);
     }
