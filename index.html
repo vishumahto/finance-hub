@@ -832,6 +832,9 @@ function computeAverages() {
     $("metricProcessed").textContent = String(a.processedMonths || 0);
   }
 
+  window.renderAverages = renderAverages;
+  window.computeFinanceHubAverages = computeAverages;
+
   function exportDatabase() {
     const blob = new Blob([JSON.stringify(storage(), null, 2)], { type: "application/json" });
     const a = document.createElement("a");
@@ -989,6 +992,14 @@ function computeAverages() {
     return -1;
   }
   
+function formatMonthKeyForLabel(key) {
+    const m = String(key || "").match(/^(\d{4})-(\d{2})$/);
+    if (!m) return String(key || "");
+    const names = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+    const idx = Number(m[2]) - 1;
+    return `${names[idx] || m[2]} ${m[1]}`;
+  }
+
 function refreshUiFromStorage() {
     const db = readHubDb();
     const months = Object.keys(db.months || {}).sort((a,b) => {
@@ -1007,11 +1018,11 @@ function refreshUiFromStorage() {
         const rec = db.months[key] || {};
         const opt = document.createElement("option");
         opt.value = key;
-        opt.textContent = key + (rec.processed ? " • Processed" : " • Draft");
+        opt.textContent = formatMonthKeyForLabel(key) + (rec.processed ? " • Processed" : " • Draft");
         sel.appendChild(opt);
       }
     }
-    renderAverages();
+    if (typeof window.renderAverages === "function") window.renderAverages();
   }
 
   function parseMonthNameToKey(monthName, fallbackKey) {
@@ -1211,7 +1222,7 @@ function refreshUiFromStorage() {
       writeHubDb(db);
       refreshUiFromStorage();
       note(`Cloud months refreshed: ${(data || []).length} row${(data || []).length === 1 ? "" : "s"} merged into this browser.`);
-      renderAverages();
+      if (typeof window.renderAverages === "function") window.renderAverages();
     } catch (err) {
       note(`Cloud load failed: ${err.message || err}`, true);
     }
