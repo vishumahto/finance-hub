@@ -413,6 +413,79 @@
     return $("activeMonth").value || new Date().toISOString().slice(0,7);
   }
 
+  function monthSortValue(key) {
+    const m = String(key || '').match(/^(\d{4})-(\d{2})$/);
+    return m ? (Number(m[1]) * 100 + Number(m[2])) : Number.MAX_SAFE_INTEGER;
+  }
+
+  function monthKeyToExpenseMonthName(monthKey) {
+    const m = String(monthKey || '').match(/^(\d{4})-(\d{2})$/);
+    if (!m) return '';
+    const names = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    return `${names[Number(m[2]) - 1] || ''} ${m[1]}`.trim();
+  }
+
+  function expenseStorageKeyFromMonthName(monthName) {
+    return 'expense_app_v19_' + String(monthName || '').trim().toLowerCase().replace(/\s+/g, '_');
+  }
+
+  function readExpenseAppStateFromStorage(preferredMonthName) {
+    try {
+      const win = expenseWindow();
+      if (win && typeof win.saveState === 'function') win.saveState();
+    } catch {}
+    const eDoc = getDoc(expenseFrame);
+    const docMonth = getInput(eDoc, 'monthName')?.value || '';
+    const activeName = monthKeyToExpenseMonthName(activeMonthValue());
+    const tried = new Set();
+    for (const monthName of [preferredMonthName, docMonth, activeName]) {
+      const clean = String(monthName || '').trim();
+      if (!clean) continue;
+      const key = expenseStorageKeyFromMonthName(clean);
+      if (tried.has(key)) continue;
+      tried.add(key);
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') return parsed;
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  function importExpenseStateIntoApp(expenseState) {
+    try {
+      if (!expenseState || typeof expenseState !== 'object') return false;
+      const monthName = String(expenseState.monthName || '').trim() || monthKeyToExpenseMonthName(activeMonthValue());
+      if (monthName) {
+        localStorage.setItem(expenseStorageKeyFromMonthName(monthName), JSON.stringify(expenseState));
+      }
+      const win = expenseWindow();
+      if (win && typeof win.loadStateForMonth === 'function' && monthName) {
+        const ok = win.loadStateForMonth(monthName);
+        if (ok) {
+          try { if (typeof win.renderAll === 'function') win.renderAll(); } catch {}
+          try { if (typeof win.saveState === 'function') win.saveState(); } catch {}
+          return true;
+        }
+      }
+      const eDoc = getDoc(expenseFrame);
+      const input = eDoc?.getElementById('importInput');
+      if (!input) return false;
+      const file = new File([JSON.stringify(expenseState, null, 2)], 'hub-import.json', { type: 'application/json' });
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    } catch (err) {
+      console.warn('Hub expense import failed', err);
+      return false;
+    }
+  }
+
   function expenseWindow() { return expenseFrame.contentWindow; }
   function payWindow() { return payFrame.contentWindow; }
 
@@ -444,6 +517,8 @@
   }
 
   function getExpenseState() {
+    const fromStorage = readExpenseAppStateFromStorage();
+    if (fromStorage) return JSON.parse(JSON.stringify(fromStorage));
     try {
       const win = expenseWindow();
       if (win && win.state) {
@@ -565,16 +640,20 @@
     if (!eDoc || !pDoc) return;
 
     const monthKey = activeMonthValue();
+    const monthName = getInput(eDoc, 'monthName')?.value || monthKeyToExpenseMonthName(monthKey);
     const db = storage();
+    const liveExpenseState = readExpenseAppStateFromStorage(monthName) || getExpenseState();
     const payload = {
       monthKey,
       processed: !!processed,
       notes: $("monthNotes").value || "",
       savedAt: new Date().toISOString(),
+      expenseState: liveExpenseState,
       expenseForm: captureForm(eDoc),
       payForm: captureForm(pDoc),
       metrics: collectMetrics()
     };
+    if (payload.metrics && !payload.metrics.expenseState) payload.metrics.expenseState = liveExpenseState;
     db.months[monthKey] = payload;
     saveStorage(db);
     refreshSavedMonths(monthKey);
@@ -586,15 +665,18 @@
     const db = storage();
     const rec = db.months[monthKey];
     if (!rec) return;
-    restoreForm(getDoc(expenseFrame), rec.expenseForm);
+    const expState = rec.expenseState || rec.metrics?.expenseState || null;
+    const imported = expState ? importExpenseStateIntoApp(expState) : false;
+    if (!imported) restoreForm(getDoc(expenseFrame), rec.expenseForm);
     restoreForm(getDoc(payFrame), rec.payForm);
     $("monthNotes").value = rec.notes || "";
     $("activeMonth").value = monthKey;
     setTimeout(() => {
       syncExpenseToPay();
       updateMetricCards();
+      renderAverages();
       setLog(`Loaded month ${monthKey}.`);
-    }, 120);
+    }, imported ? 900 : 180);
   }
 
   function deleteMonth(monthKey) {
@@ -609,7 +691,7 @@
 
   function refreshSavedMonths(selected) {
     const db = storage();
-    const months = Object.keys(db.months).sort().reverse();
+    const months = Object.keys(db.months).sort((a,b) => monthSortValue(a) - monthSortValue(b) || String(a).localeCompare(String(b)));
     const sel = $("savedMonths");
     sel.innerHTML = "";
     const opt0 = document.createElement("option");
@@ -654,10 +736,28 @@ function computeAverages() {
     if (!rows.length) return metrics;
 
     const avg = (arr) => arr.length ? arr.reduce((a,b)=>a+b,0) / arr.length : 0;
-    const pickAmount = (shared, targetLabel) => {
-      const target = String(targetLabel || "").trim().toLowerCase();
-      const row = (shared || []).find(item => String(item?.label || "").trim().toLowerCase() === target);
+    const norm = (s) => String(s || '').trim().toLowerCase();
+    const sharedAmount = (state, targetLabel) => {
+      const target = norm(targetLabel);
+      const row = ((state && state.shared) || []).find(item => norm(item?.label) === target);
       return num(row?.amount);
+    };
+    const groceryAdjusted = (row) => {
+      const realBill = num(row?.realBill);
+      const factor = num(row?.factor || 1) || 1;
+      const textToDollarSum = (txt) => String(txt || '').match(/\$?\s*\d+(?:,\d{3})*(?:\.\d+)?/g)?.reduce((sum, part) => {
+        const clean = String(part).replace(/[^0-9.\-]/g, '');
+        return sum + (Number(clean) || 0);
+      }, 0) || 0;
+      const discounted = realBill * factor;
+      const excluded = textToDollarSum(row?.notUsedText);
+      const fullPay = textToDollarSum(row?.fullPayText);
+      return Math.max(0, discounted - excluded - fullPay);
+    };
+    const foodAmount = (state) => {
+      const explicit = sharedAmount(state, 'Food_Calculated_Separately');
+      if (explicit > 0) return explicit;
+      return round2(((state && state.grocery) || []).reduce((sum, row) => sum + groceryAdjusted(row), 0));
     };
 
     const rentVals = [];
@@ -679,27 +779,28 @@ function computeAverages() {
       hoursVals.push(num(m.expense?.vishuHoursPerWeek));
       vishuMonthVals.push(num(m.expense?.vishuMonthlyGross));
 
-      const shared = m.expenseState?.shared || row.expenseState?.shared || [];
-      rentVals.push(pickAmount(shared, "Apartment_250_Boyd_Ave"));
-      foodVals.push(pickAmount(shared, "Food_Calculated_Separately"));
-      carVals.push(pickAmount(shared, "Fuel_50_50"));
-      electricityVals.push(pickAmount(shared, "Electricity_250_Boyd_Ave"));
-      internetVals.push(pickAmount(shared, "Internet_Verizon_FIOS"));
-      tuitionVals.push(pickAmount(shared, "Viaan@PCD_Tuition"));
-      insuranceVals.push(pickAmount(shared, "Insurance_Health_Vishu_Viaan"));
+      const state = row.expenseState || m.expenseState || null;
+      if (!state) return;
+      rentVals.push(sharedAmount(state, 'Apartment_250_Boyd_Ave'));
+      foodVals.push(foodAmount(state));
+      carVals.push(sharedAmount(state, 'Fuel_50_50'));
+      electricityVals.push(sharedAmount(state, 'Electricity_250_Boyd_Ave'));
+      internetVals.push(sharedAmount(state, 'Internet_Verizon_FIOS'));
+      tuitionVals.push(sharedAmount(state, 'Viaan@PCD_Tuition'));
+      insuranceVals.push(sharedAmount(state, 'Insurance_Health_Vishu_Viaan'));
     });
 
-    metrics.avgRent = avg(rentVals);
-    metrics.avgFood = avg(foodVals);
-    metrics.avgCar = avg(carVals);
-    metrics.avgElectricity = avg(electricityVals);
-    metrics.avgInternet = avg(internetVals);
-    metrics.avgViaanTuition = avg(tuitionVals);
-    metrics.avgHealthInsurance = avg(insuranceVals);
-    metrics.avgAnuYearlyGross = avg(anuVals);
-    metrics.avgVishuHourlyRate = avg(hourlyVals);
-    metrics.avgVishuHoursPerWeek = avg(hoursVals);
-    metrics.avgVishuMonthlyGross = avg(vishuMonthVals);
+    metrics.avgRent = avg(rentVals.filter(v => Number.isFinite(v)));
+    metrics.avgFood = avg(foodVals.filter(v => Number.isFinite(v)));
+    metrics.avgCar = avg(carVals.filter(v => Number.isFinite(v)));
+    metrics.avgElectricity = avg(electricityVals.filter(v => Number.isFinite(v)));
+    metrics.avgInternet = avg(internetVals.filter(v => Number.isFinite(v)));
+    metrics.avgViaanTuition = avg(tuitionVals.filter(v => Number.isFinite(v)));
+    metrics.avgHealthInsurance = avg(insuranceVals.filter(v => Number.isFinite(v)));
+    metrics.avgAnuYearlyGross = avg(anuVals.filter(v => Number.isFinite(v) && v > 0));
+    metrics.avgVishuHourlyRate = avg(hourlyVals.filter(v => Number.isFinite(v) && v > 0));
+    metrics.avgVishuHoursPerWeek = avg(hoursVals.filter(v => Number.isFinite(v) && v > 0));
+    metrics.avgVishuMonthlyGross = avg(vishuMonthVals.filter(v => Number.isFinite(v) && v > 0));
     return metrics;
   }
 
@@ -892,8 +993,8 @@ function refreshUiFromStorage() {
     const db = readHubDb();
     const months = Object.keys(db.months || {}).sort((a,b) => {
       const sa = monthSortKey(a), sb = monthSortKey(b);
-      if (sa !== -1 || sb !== -1) return sb - sa || String(b).localeCompare(String(a));
-      return String(b).localeCompare(String(a));
+      if (sa !== -1 || sb !== -1) return sa - sb || String(a).localeCompare(String(b));
+      return String(a).localeCompare(String(b));
     });
     const sel = $("savedMonths");
     if (sel) {
@@ -1094,7 +1195,7 @@ function refreshUiFromStorage() {
         .from("months")
         .select("month_key, processed, payload, user_id")
         .eq("user_id", user.id)
-        .order("month_key", { ascending: false });
+        .order("month_key", { ascending: true });
       if (error) return note(`Cloud load failed: ${error.message}`, true);
       const db = readHubDb();
       for (const row of (data || [])) {
@@ -1110,6 +1211,7 @@ function refreshUiFromStorage() {
       writeHubDb(db);
       refreshUiFromStorage();
       note(`Cloud months refreshed: ${(data || []).length} row${(data || []).length === 1 ? "" : "s"} merged into this browser.`);
+      renderAverages();
     } catch (err) {
       note(`Cloud load failed: ${err.message || err}`, true);
     }
